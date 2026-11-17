@@ -1,0 +1,1 @@
+Порівнювалися logistic_regression_v1 і random_forest_v1. У logistic_regression_v1 кращий recall, precision гірший але не набагато, roc_auc приблизно однаковий. Тому logistic_regression_v1 в даному випадку краща модель. 
