@@ -2,7 +2,7 @@
 
 ## Мета проєкту
 
-Сформувати структуру MLOps-проєкту, перевірити якість вхідних даних, зафіксувати версію датасету, навчити базові моделі бінарної класифікації та відстежувати експерименти за допомогою MLflow з реєстрацією найкращої моделі в Model Registry.
+Побудувати наскрізний MLOps-проєкт: перевірити якість вхідних даних, зафіксувати версію датасету, навчити моделі з відстеженням експериментів у MLflow, а потім розгорнути навчену модель як REST API (FastAPI) і запакувати сервіс у Docker-образ.
 
 Цільова змінна `Churn` має два значення: клієнт залишився (`No`, 0) або пішов (`Yes`, 1).
 
@@ -14,22 +14,26 @@
 - Цільова колонка: `Churn`
 - Посилання: https://www.kaggle.com/datasets/blastchar/telco-customer-churn
 
-> Особливість датасету: колонка `TotalCharges` містить порожні або пробільні значення. Вони трактуються як пропущені і обробляються на етапі версіонування даних.
+> Колонка `TotalCharges` містить порожні або пробільні значення. Вони трактуються як пропущені й обробляються на етапі версіонування даних.
 
 ## Структура директорій
 
 ```text
 customer-churn-mlops/
+├── app/
+│   ├── __init__.py
+│   └── main.py                  # FastAPI inference-сервіс
 ├── configs/
 │   └── data_schema.yaml
 ├── data/
-│   ├── raw/
-│   │   └── churn.csv
+│   ├── raw/churn.csv
 │   └── processed/
 │       ├── churn_v1.csv
 │       └── churn_v1_metadata.json
-├── models/
-├── mlruns/                  # локальне сховище MLflow (не в Git)
+├── examples/
+│   └── predict_request.json     # приклад запиту до /predict
+├── models/                      # latest_model.joblib (не в Git)
+├── mlruns/                      # локальне сховище MLflow (не в Git)
 ├── notebooks/
 ├── reports/
 │   ├── latest_metrics.json
@@ -42,6 +46,8 @@ customer-churn-mlops/
 │   ├── version_data.py
 │   └── train.py
 ├── tests/
+├── Dockerfile
+├── .dockerignore
 ├── README.md
 ├── requirements.txt
 └── .gitignore
@@ -61,9 +67,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Основні залежності: pandas, scikit-learn, joblib, pytest, pyyaml, mlflow.
+Основні залежності: pandas, scikit-learn, joblib, pytest, pyyaml, mlflow, fastapi, uvicorn, pydantic.
 
-## Запуск пайплайна
+## Підготовка даних і навчання
 
 Усі команди виконуються з **кореня проєкту**.
 
@@ -75,68 +81,131 @@ python src/train.py           # 3. навчання моделі з логува
 
 - `validate_data.py` перевіряє `data/raw/churn.csv` за схемою `configs/data_schema.yaml`. Статус `passed` означає, що критичних помилок немає, `failed` означає, що знайдено помилки, і скрипт завершується з кодом `1`.
 - `version_data.py` створює `data/processed/churn_v1.csv` та метадані з SHA-256 хешами.
-- `train.py` навчає модель на версії даних `v1`.
+- `train.py` навчає модель на версії даних `v1`, логує параметри, метрики, звіт і модель у MLflow та зберігає `models/latest_model.joblib`.
 
-## MLflow: відстеження експериментів і реєстр моделей
+> Файл `models/latest_model.joblib` перезаписується кожним запуском навчання. API використовує саме його, тому перед запуском сервісу переконайтеся, що останньою навчено потрібну модель.
 
-### Запуск MLflow UI
+## MLflow: експерименти та Model Registry
 
-У **першому** терміналі (з кореня проєкту):
+Запуск UI (перший термінал, з кореня проєкту):
 
 ```bash
 mlflow ui --host 127.0.0.1 --port 5000
 ```
 
-Відкрийте в браузері: http://127.0.0.1:5000
+Відкрийте http://127.0.0.1:5000.
 
-### Запуск експериментів
+- Experiment: `customer-churn-baseline`.
+- Для кожного run логуються параметри (`model_type`, `data_version`, `test_size`, `random_state`), метрики (`accuracy`, `precision`, `recall`, `f1`, `roc_auc`), artifact `latest_metrics.json` і модель.
+- Усі runs зберігаються локально в папці `mlruns/` (у директорії, звідки запущено `mlflow ui` і `train.py`).
+- Модель реєструється як **`CustomerChurnClassifier`**; версії видно у вкладці **Models**.
+- Вибір найкращої моделі описано в `reports/model_selection.md`.
 
-У **другому** терміналі (з активованим `.venv`, також з кореня проєкту):
+## Inference API (FastAPI)
+
+Сервіс завантажує `models/latest_model.joblib` під час старту й надає такі endpoints:
+
+| Endpoint | Метод | Призначення |
+|---|---|---|
+| `/health` | GET | стан сервісу та чи завантажена модель |
+| `/predict` | POST | прогноз відтоку для одного клієнта |
+| `/docs` | GET | Swagger UI (інтерактивна документація) |
+
+### Запуск локально
 
 ```bash
-python src/train.py
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Тип моделі обирається в кінці `src/train.py` у виклику `main(model_type=...)`:
+Swagger UI: http://127.0.0.1:8000/docs
 
-- `logistic_regression`: `StandardScaler` + `LogisticRegression`;
-- `random_forest`: `RandomForestClassifier`.
+### Приклад запиту
 
-Щоб порівняти моделі, потрібно запустити навчання щонайменше двічі з різними значеннями `model_type`.
+Файл `examples/predict_request.json`:
 
-Кожен запуск у MLflow логує:
+```json
+{
+  "gender": "Female",
+  "SeniorCitizen": 0,
+  "Partner": "Yes",
+  "Dependents": "No",
+  "tenure": 12,
+  "PhoneService": "Yes",
+  "Contract": "Month-to-month",
+  "MonthlyCharges": 70.0,
+  "TotalCharges": 850.0
+}
+```
 
-| Що | Деталі |
-|---|---|
-| Параметри | `model_type`, `data_version`, `test_size`, `random_state` |
-| Метрики | `accuracy`, `precision`, `recall`, `f1`, `roc_auc` |
-| Artifact | `reports/latest_metrics.json` |
-| Модель | `mlflow.sklearn.log_model` (artifact `model`) |
+**macOS / Linux (bash):**
 
-Назва experiment: `customer-churn-baseline`.
+```bash
+curl http://127.0.0.1:8000/health
 
-### Де зберігаються MLflow runs
+curl -X POST http://127.0.0.1:8000/predict \
+  -H "Content-Type: application/json" \
+  -d @examples/predict_request.json
+```
 
-Усі runs, метрики, параметри й артефакти зберігаються **локально в папці `mlruns/`** у тій директорії, звідки запущено `mlflow ui` і `train.py`. Тому обидві команди потрібно запускати з кореня проєкту: тоді UI та скрипт працюють з однією папкою `mlruns/`.
+**Windows (PowerShell):** потрібно викликати `curl.exe`, бо `curl` у PowerShell є псевдонімом `Invoke-WebRequest`. Команду записують в один рядок:
 
-Папка `mlruns/` створюється автоматично і додана в `.gitignore`. Файли `models/latest_model.joblib` також не комітяться.
+```powershell
+curl.exe http://127.0.0.1:8000/health
 
-### Як переглянути runs
+curl.exe -X POST http://127.0.0.1:8000/predict -H "Content-Type: application/json" -d "@examples/predict_request.json"
+```
 
-1. Відкрийте http://127.0.0.1:5000.
-2. Перейдіть до experiment `customer-churn-baseline`.
-3. У списку runs можна порівняти параметри та метрики. Для порівняння виберіть кілька runs і натисніть **Compare**.
-4. Відкрийте конкретний run, щоб побачити вкладку **Artifacts** (звіт `latest_metrics.json` і папка `model`).
+Альтернатива для PowerShell:
 
-### Як переглянути Model Registry
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/predict `
+  -ContentType "application/json" `
+  -Body (Get-Content examples/predict_request.json -Raw)
+```
 
-1. У верхньому меню MLflow UI відкрийте вкладку **Models** (або перейдіть за адресою http://127.0.0.1:5000/#/models).
-2. Оберіть модель **`CustomerChurnClassifier`**.
-3. Тут видно всі її версії (Version 1, 2, ...). Кожна версія посилається на run, з якого вона створена, тобто пов'язана з параметрами, метриками та версією даних.
+### Приклад відповіді
 
-Модель реєструється автоматично під час навчання через параметр `registered_model_name="CustomerChurnClassifier"`. Кожен запуск створює нову версію. Найкращу версію обирають за основною метрикою, обґрунтування наведено в `reports/model_selection.md`.
+```json
+{
+  "churn_prediction": 0,
+  "churn_probability": 0.0,
+  "risk_label": "low"
+}
+```
 
-> Для `random_forest` у `log_model` передається `skops_trusted_types=["sklearn.tree._tree.Tree"]`: MLflow зберігає sklearn-моделі у форматі skops і вимагає явно довірити цей тип. Модель створена в цьому ж проєкті, тож їй можна довіряти.
+> Підставте сюди реальну відповідь вашого сервісу. `risk_label` дорівнює `high`, якщо `churn_probability >= 0.5`, інакше `low`.
+
+## Docker
+
+Для запуску потрібен Docker Desktop (він має бути запущений, статус **Engine running**).
+
+Збірка образу (з кореня проєкту):
+
+```bash
+docker build -t churn-api:latest .
+```
+
+Запуск контейнера:
+
+```bash
+docker run --rm -p 8000:8000 churn-api:latest
+```
+
+Перевірка (в іншому терміналі) виконується тими самими командами `curl`, що й для локального запуску: http://127.0.0.1:8000/docs.
+
+Що входить в образ: код `app/` і `src/`, файл `models/latest_model.joblib` та залежності з `requirements.txt`. Файл `.dockerignore` виключає `.venv`, `.git`, `mlruns`, `notebooks`, `reports` та кеш. Контейнер слухає `0.0.0.0:8000`, порт відкривається через `-p 8000:8000`.
+
+> Перед збіркою має існувати локальний файл `models/latest_model.joblib` (його створює `python src/train.py`). У Git він не комітиться, тому на новій машині спочатку потрібно навчити модель.
+
+## Обмеження поточного inference pipeline
+
+1. **Preprocessing не зберігається разом із моделлю.** У `/predict` кодування категорій (`pd.get_dummies`) дублює логіку з навчання. Якщо вона розійдеться з `prepare_features`, прогнози стануть хибними.
+2. **Вирівнювання колонок.** Модель навчена на повному наборі one-hot колонок, а запит одного клієнта містить лише частину ознак. Тому в API колонки вирівнюються через `reindex(columns=model.feature_names_in_, fill_value=0)`, а відсутні ознаки заповнюються нулями.
+3. **Неповний набір ознак у запиті.** API приймає 9 полів, а модель навчалась на всіх колонках датасету (`Contract`, `DeviceProtection` та інші), тому прогноз є наближеним.
+4. **Невідомі категорії** ігноруються (усі відповідні колонки стають нулями) замість явної помилки.
+5. **Розмір образу.** Через `mlflow` у `requirements.txt` збірка довга, а образ великий; для production потрібен окремий мінімальний набір залежностей для inference.
+
+**Можливе покращення:** зберігати разом із моделлю повний `sklearn.pipeline.Pipeline` (`ColumnTransformer` з `OneHotEncoder(handle_unknown="ignore")` + модель). Тоді API передає сирі дані, а кодування відбувається всередині моделі, і розбіжність між навчанням та inference неможлива.
 
 ## Версія даних, яку використовує модель
 
@@ -147,19 +216,15 @@ python src/train.py
 | Метадані | `data/processed/churn_v1_metadata.json` |
 | Звіт валідації | `reports/data_validation_report.json` |
 
-Версія даних логується в кожному MLflow run як параметр `data_version`, тож кожен результат можна однозначно пов'язати з датасетом, на якому навчена модель.
-
 ## Результати експериментів
-
-Результати на тестовій вибірці (дані `v1`):
 
 | Модель | Accuracy | Precision | Recall | F1 | ROC-AUC |
 |---|---|---|---|---|---|
 | logistic_regression | … | … | … | … | … |
 | random_forest | … | … | … | … | … |
 
-Основна метрика для вибору моделі: **…** (див. `reports/model_selection.md`).
+Основна метрика для вибору моделі: **…** (див. `reports/model_selection.md`). Модель, що обслуговується API: **…**.
 
 ## Висновок
 
-Додано відстеження експериментів у MLflow: параметри, версія даних, метрики, звіт і модель логуються для кожного запуску, що дозволяє порівнювати моделі та відтворювати результати. Найкращу модель за основною метрикою зареєстровано в Model Registry як `CustomerChurnClassifier`. Обрана модель: … (обґрунтування в `reports/model_selection.md`).
+Навчену модель перетворено на inference-сервіс: FastAPI надає endpoints `/health` і `/predict`, а Docker дозволяє запускати його в ізольованому середовищі з усіма залежностями. Основне обмеження полягає в тому, що preprocessing у API дублює логіку навчання й не зберігається разом із моделлю. Тому наступним кроком має стати збереження повного `Pipeline`, щоб навчання та inference використовували однакову обробку даних.
